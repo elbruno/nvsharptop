@@ -10,7 +10,7 @@ var cliParameters = CliParameters.Create(args);
 var session = new UserSession(cliParameters);
 var devices = new DeviceCollection();
 AnsiConsole.Clear();
-var renderer = new DeviceCollectionRenderer(cliParameters.DisplayInterval);
+var renderer = new DeviceCollectionRenderer(cliParameters.DisplayInterval, cliParameters.ScaleInterval);
 while (!session.IsCancelled)
 {
     devices.Update();
@@ -120,7 +120,7 @@ class DeviceCollection : IEnumerable<DeviceInfo>
 }
 
 
-record CliParameters(double SampleInterval, double DisplayInterval, bool CleanupScreen)
+record CliParameters(double SampleInterval, double DisplayInterval, int ScaleInterval, bool CleanupScreen)
 {
     public static CliParameters Create(string[] args)
     {
@@ -130,9 +130,10 @@ record CliParameters(double SampleInterval, double DisplayInterval, bool Cleanup
             Environment.Exit(0);
         }
         double sample = ParseArg(args, "--sample-interval", 0.1);
-        double display = ParseArg(args, "--display-interval", 3);
+        double display = ParseArg(args, "--display-interval", 1);
+        int scale = ParseIntArg(args, "--scale-interval", 5);
         bool cleanup = ParseBoolArg(args, "--cleanup-screen", true);
-        return new CliParameters(sample, display, cleanup);
+        return new CliParameters(sample, display, scale, cleanup);
     }
 
     private static void PrintHelp()
@@ -140,7 +141,8 @@ record CliParameters(double SampleInterval, double DisplayInterval, bool Cleanup
         Console.WriteLine("Usage: dotnet run nvsharptop.cs [options]\n");
         Console.WriteLine("Options:");
         Console.WriteLine("  --sample-interval <sec>   Set the sample interval in seconds (default: 0.1)");
-        Console.WriteLine("  --display-interval <sec>  Set the display refresh interval in seconds (default: 3)");
+        Console.WriteLine("  --display-interval <sec>  Set the display refresh interval in seconds (default: 1)");
+        Console.WriteLine("  --scale-interval <pct>    Set the Y-axis scale interval in percent (default: 5)");
         Console.WriteLine("  --cleanup-screen <true|false>  Clear the screen on exit (default: true)");
         Console.WriteLine("  --help, -h                Show this help message and exit");
     }
@@ -149,6 +151,12 @@ record CliParameters(double SampleInterval, double DisplayInterval, bool Cleanup
     {
         for (int i = 0; i + 1 < args.Length; i++)
             if (args[i] == name && double.TryParse(args[i + 1], out var t) && t > 0) return t;
+        return def;
+    }
+    private static int ParseIntArg(string[] args, string name, int def)
+    {
+        for (int i = 0; i + 1 < args.Length; i++)
+            if (args[i] == name && int.TryParse(args[i + 1], out var t) && t > 0) return t;
         return def;
     }
     private static bool ParseBoolArg(string[] args, string name, bool def)
@@ -187,11 +195,13 @@ class DeviceCollectionRenderer
     private readonly int yAxisWidth;
     private readonly int graphHeight;
     private readonly double displayInterval;
-    public DeviceCollectionRenderer(double displayInterval, int yAxisWidth = 6, int graphHeight = 10)
+    private readonly int scaleInterval;
+    public DeviceCollectionRenderer(double displayInterval, int scaleInterval, int yAxisWidth = 6)
     {
         this.displayInterval = displayInterval;
+        this.scaleInterval = scaleInterval;
         this.yAxisWidth = yAxisWidth;
-        this.graphHeight = graphHeight;
+        this.graphHeight = 100 / scaleInterval;
     }
 
     public void TryRender(DeviceCollection devices)
@@ -203,7 +213,7 @@ class DeviceCollectionRenderer
         {
             devices.UpdateDeviceHistory(graphWidth);
             var display = new DeviceCollectionDisplay();
-            display.Render(devices, graphWidth, graphHeight, availableWidth, displayInterval);
+            display.Render(devices, graphWidth, graphHeight, availableWidth, displayInterval, scaleInterval);
             devices.LastDisplay = DateTime.UtcNow;
             Console.CursorVisible = false;
             Console.SetCursorPosition(0, 0);
@@ -218,10 +228,10 @@ class DeviceCollectionRenderer
 
 class DeviceCollectionDisplay
 {
-    public void Render(DeviceCollection devices, int graphWidth, int graphHeight, int availableWidth, double displayInterval)
+    public void Render(DeviceCollection devices, int graphWidth, int graphHeight, int availableWidth, double displayInterval, int scaleInterval)
     {
         var renderables = new List<IRenderable>();
-        renderables.AddRange(DeviceGraphDisplay.Render(devices, graphWidth, graphHeight, availableWidth));
+        renderables.AddRange(DeviceGraphDisplay.Render(devices, graphWidth, graphHeight, availableWidth, scaleInterval));
         renderables.AddRange(DeviceCollectionTable.Render(devices, displayInterval));
         var grid = new Grid();
         grid.AddColumn();
@@ -266,18 +276,18 @@ static class DeviceCollectionTable
 
 static class DeviceGraphDisplay
 {
-    public static List<IRenderable> Render(DeviceCollection devices, int graphWidth, int graphHeight, int availableWidth)
+    public static List<IRenderable> Render(DeviceCollection devices, int graphWidth, int graphHeight, int availableWidth, int scaleInterval)
     {
         var renderables = new List<IRenderable>();
         foreach (var device in devices)
         {
             var samples = devices.GetHistory(device)?.GetSamples() ?? Array.Empty<DeviceSample>();
-            renderables.AddRange(RenderDeviceChartSpectre(device, samples, graphWidth, graphHeight, availableWidth));
+            renderables.AddRange(RenderDeviceChartSpectre(device, samples, graphWidth, graphHeight, availableWidth, scaleInterval));
         }
         return renderables;
     }
 
-    private static List<IRenderable> RenderDeviceChartSpectre(DeviceInfo device, DeviceSample[] samples, int graphWidth, int graphHeight, int _)
+    private static List<IRenderable> RenderDeviceChartSpectre(DeviceInfo device, DeviceSample[] samples, int graphWidth, int graphHeight, int _, int scaleInterval)
     {
         List<IRenderable> renderables = [
             new Markup($"[bold]{device.Type} {device.Id}[/] [grey]{device.Name}[/]\n")
@@ -288,7 +298,7 @@ static class DeviceGraphDisplay
         for (int row = graphHeight - 1; row >= 0; row--)
         {
             int percent = (int)Math.Round((row + 1) * 100.0 / graphHeight);
-            string yLabel = (percent % 5 == 0 || row == graphHeight - 1) ? $"[grey]{percent,3}%[/] │" : "    │";
+            string yLabel = (percent % scaleInterval == 0 || row == graphHeight - 1) ? $"[grey]{percent,3}%[/] │" : "    │";
             var bars = new List<string>();
             int pad = graphWidth - samples.Length;
             for (int i = 0; i < pad; i++)
@@ -302,7 +312,7 @@ static class DeviceGraphDisplay
                 bool uOn = s.Util * graphHeight / 100 > row;
                 bool mOn = s.MemPct * graphHeight / 100 > row;
                 string utilColor = s.Util >= 80 ? "red" : s.Util >= 40 ? "yellow" : "green";
-                if ((percent % 5 == 0 || row == graphHeight - 1) && !uOn && !mOn)
+                if ((percent % scaleInterval == 0 || row == graphHeight - 1) && !uOn && !mOn)
                     bars.Add("[grey]··[/]");
                 else
                     bars.Add($"{(uOn ? $"[{utilColor}]█[/]" : " ")}{(mOn ? "[cyan]█[/]" : " ")}");
