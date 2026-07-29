@@ -1,4 +1,3 @@
-#:property PublishAot=true
 #:package Spectre.Console@*
 
 using System.Diagnostics;
@@ -138,7 +137,7 @@ record CliParameters(double SampleInterval, double DisplayInterval, int ScaleInt
 
     private static void PrintHelp()
     {
-        Console.WriteLine("Usage: dotnet run nvsharptop.cs [options]\n");
+        Console.WriteLine("Usage: dotnet run --file nvsharptop.cs -- [options]\n");
         Console.WriteLine("Options:");
         Console.WriteLine("  --sample-interval <sec>   Set the sample interval in seconds (default: 0.1)");
         Console.WriteLine("  --display-interval <sec>  Set the display refresh interval in seconds (default: 1)");
