@@ -9,11 +9,14 @@ var cliParameters = CliParameters.Create(args);
 var session = new UserSession(cliParameters);
 var devices = new DeviceCollection();
 AnsiConsole.Clear();
-var renderer = new DeviceCollectionRenderer(cliParameters.DisplayInterval, cliParameters.ScaleInterval);
+var renderer = new DeviceCollectionRenderer(cliParameters.DisplayInterval);
 while (!session.IsCancelled)
 {
+    bool modeChanged = renderer.ReadModeInput();
+    if (renderer.IsQuitRequested)
+        break;
     devices.Update();
-    renderer.TryRender(devices);
+    renderer.TryRender(devices, modeChanged);
     session.Sleep();
 }
 if (cliParameters.CleanupScreen)
@@ -25,56 +28,36 @@ public enum DeviceType
     Gpu
 }
 
-class DeviceSample
-{
-    public int Util { get; set; }
-    public int MemPct { get; set; }
-    public DeviceSample(int util, int memPct) { Util = util; MemPct = memPct; }
-}
-
-class DeviceHistory
-{
-    public Queue<DeviceSample> Samples { get; } = new();
-    public void AddSample(DeviceSample sample, int maxSamples)
-    {
-        Samples.Enqueue(sample);
-        while (Samples.Count > maxSamples) Samples.Dequeue();
-    }
-    public DeviceSample[] GetSamples() => Samples.ToArray();
-}
-
 record DeviceInfo(string Id, string Name, int Temp, int Util, int MemUsed, int MemTotal, DeviceType Type);
 
 class DeviceCollection : IEnumerable<DeviceInfo>
 {
-    public Dictionary<string, DeviceHistory> History = new();
-    public Dictionary<string, List<DeviceSample>> SampleBuffer = new();
     public DateTime LastDisplay = DateTime.UtcNow;
+    private readonly Dictionary<string, Queue<(int Util, int MemPct)>> history = new();
     private List<DeviceInfo> devices = new();
-
-    public DeviceHistory? GetHistory(DeviceInfo device)
-    {
-        return History.TryGetValue(device.Id, out var hist) ? hist : null;
-    }
 
     public void Update()
     {
         devices = QueryDevices();
-        CollectDeviceSamples();
     }
 
-    public void UpdateDeviceHistory(int graphWidth)
+    public void AddHistorySamples(int maxSamples)
     {
         foreach (var device in devices)
         {
-            if (!History.TryGetValue(device.Id, out var hist))
-                History[device.Id] = hist = new DeviceHistory();
-            var buf = SampleBuffer[device.Id];
-            int avgUtil = (int)buf.Average(x => x.Util);
-            int avgMem = (int)buf.Average(x => x.MemPct);
-            hist.AddSample(new DeviceSample(avgUtil, avgMem), graphWidth);
-            buf.Clear();
+            if (!history.TryGetValue(device.Id, out var samples))
+                history[device.Id] = samples = new Queue<(int Util, int MemPct)>();
+
+            int memPct = device.MemTotal == 0 ? 0 : Math.Clamp((int)(device.MemUsed * 100.0 / device.MemTotal), 0, 100);
+            samples.Enqueue((Math.Clamp(device.Util, 0, 100), memPct));
+            while (samples.Count > maxSamples)
+                samples.Dequeue();
         }
+    }
+
+    public (int Util, int MemPct)[] GetHistory(DeviceInfo device)
+    {
+        return history.TryGetValue(device.Id, out var samples) ? samples.ToArray() : [];
     }
 
     private List<DeviceInfo> QueryDevices()
@@ -103,23 +86,12 @@ class DeviceCollection : IEnumerable<DeviceInfo>
             .ToList();
     }
 
-    private void CollectDeviceSamples()
-    {
-        foreach (var device in devices)
-        {
-            if (!SampleBuffer.TryGetValue(device.Id, out var buf))
-                SampleBuffer[device.Id] = buf = new List<DeviceSample>();
-            int memPct = (int)(device.MemUsed * 100.0 / device.MemTotal);
-            buf.Add(new DeviceSample(device.Util, memPct));
-        }
-    }
-
     public IEnumerator<DeviceInfo> GetEnumerator() => devices.GetEnumerator();
     System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
 }
 
 
-record CliParameters(double SampleInterval, double DisplayInterval, int ScaleInterval, bool CleanupScreen)
+record CliParameters(double SampleInterval, double DisplayInterval, bool CleanupScreen)
 {
     public static CliParameters Create(string[] args)
     {
@@ -130,9 +102,8 @@ record CliParameters(double SampleInterval, double DisplayInterval, int ScaleInt
         }
         double sample = ParseArg(args, "--sample-interval", 0.1);
         double display = ParseArg(args, "--display-interval", 1);
-        int scale = ParseIntArg(args, "--scale-interval", 5);
         bool cleanup = ParseBoolArg(args, "--cleanup-screen", true);
-        return new CliParameters(sample, display, scale, cleanup);
+        return new CliParameters(sample, display, cleanup);
     }
 
     private static void PrintHelp()
@@ -141,8 +112,8 @@ record CliParameters(double SampleInterval, double DisplayInterval, int ScaleInt
         Console.WriteLine("Options:");
         Console.WriteLine("  --sample-interval <sec>   Set the sample interval in seconds (default: 0.1)");
         Console.WriteLine("  --display-interval <sec>  Set the display refresh interval in seconds (default: 1)");
-        Console.WriteLine("  --scale-interval <pct>    Set the Y-axis scale interval in percent (default: 5)");
         Console.WriteLine("  --cleanup-screen <true|false>  Clear the screen on exit (default: true)");
+        Console.WriteLine("  Press A for the table, B for meters, C for history bars, Tab to cycle, or Q to quit");
         Console.WriteLine("  --help, -h                Show this help message and exit");
     }
 
@@ -150,12 +121,6 @@ record CliParameters(double SampleInterval, double DisplayInterval, int ScaleInt
     {
         for (int i = 0; i + 1 < args.Length; i++)
             if (args[i] == name && double.TryParse(args[i + 1], out var t) && t > 0) return t;
-        return def;
-    }
-    private static int ParseIntArg(string[] args, string name, int def)
-    {
-        for (int i = 0; i + 1 < args.Length; i++)
-            if (args[i] == name && int.TryParse(args[i + 1], out var t) && t > 0) return t;
         return def;
     }
     private static bool ParseBoolArg(string[] args, string name, bool def)
@@ -191,31 +156,65 @@ class UserSession
 
 class DeviceCollectionRenderer
 {
-    private readonly int yAxisWidth;
-    private readonly int graphHeight;
     private readonly double displayInterval;
-    private readonly int scaleInterval;
-    public DeviceCollectionRenderer(double displayInterval, int scaleInterval, int yAxisWidth = 6)
+    private DisplayMode mode = DisplayMode.A;
+    public bool IsQuitRequested { get; private set; }
+
+    public DeviceCollectionRenderer(double displayInterval)
     {
         this.displayInterval = displayInterval;
-        this.scaleInterval = scaleInterval;
-        this.yAxisWidth = yAxisWidth;
-        this.graphHeight = 100 / scaleInterval;
     }
 
-    public void TryRender(DeviceCollection devices)
+    public bool ReadModeInput()
     {
-        int consoleWidth = Console.WindowWidth;
-        int availableWidth = consoleWidth - yAxisWidth;
-        int graphWidth = (int)Math.Floor((double)availableWidth / 3) - 1;
-        if (ShouldDisplay(devices.LastDisplay, displayInterval))
+        bool changed = false;
+        while (Console.KeyAvailable)
         {
-            devices.UpdateDeviceHistory(graphWidth);
+            var key = Console.ReadKey(intercept: true).Key;
+            if (key == ConsoleKey.Q)
+            {
+                IsQuitRequested = true;
+                break;
+            }
+            var newMode = key switch
+            {
+                ConsoleKey.A => DisplayMode.A,
+                ConsoleKey.B => DisplayMode.B,
+                ConsoleKey.C => DisplayMode.C,
+                ConsoleKey.Tab => mode == DisplayMode.A ? DisplayMode.B : DisplayMode.A,
+                _ => mode
+            };
+            if (key == ConsoleKey.Tab && mode == DisplayMode.B)
+                newMode = DisplayMode.C;
+            else if (key == ConsoleKey.Tab && mode == DisplayMode.C)
+                newMode = DisplayMode.A;
+            if (newMode != mode)
+            {
+                mode = newMode;
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    public void TryRender(DeviceCollection devices, bool force = false)
+    {
+        if (force || ShouldDisplay(devices.LastDisplay, displayInterval))
+        {
+            int consoleWidth = Math.Max(1, Console.WindowWidth);
+            int columnCount = mode == DisplayMode.C ? 1 : consoleWidth >= 80 && devices.Count() > 1 ? 2 : 1;
+            int panelWidth = Math.Max(1, (consoleWidth - (columnCount - 1) * 4) / columnCount);
+            int meterWidth = Math.Clamp((panelWidth - 26) / 4, 8, 20);
+            int graphWidth = Math.Max(1, panelWidth - 20);
+            if (mode == DisplayMode.C)
+                devices.AddHistorySamples(graphWidth);
             var display = new DeviceCollectionDisplay();
-            display.Render(devices, graphWidth, graphHeight, availableWidth, displayInterval, scaleInterval);
+            Console.SetCursorPosition(0, 0);
+            AnsiConsole.Clear();
+            Console.SetCursorPosition(0, 0);
+            display.Render(devices, meterWidth, columnCount, graphWidth, displayInterval, mode);
             devices.LastDisplay = DateTime.UtcNow;
             Console.CursorVisible = false;
-            Console.SetCursorPosition(0, 0);
         }
     }
 
@@ -225,104 +224,161 @@ class DeviceCollectionRenderer
     }
 }
 
+enum DisplayMode
+{
+    A,
+    B,
+    C
+}
+
 class DeviceCollectionDisplay
 {
-    public void Render(DeviceCollection devices, int graphWidth, int graphHeight, int availableWidth, double displayInterval, int scaleInterval)
+    public void Render(DeviceCollection devices, int meterWidth, int columnCount, int graphWidth, double displayInterval, DisplayMode mode)
     {
-        var renderables = new List<IRenderable>();
-        renderables.AddRange(DeviceGraphDisplay.Render(devices, graphWidth, graphHeight, availableWidth, scaleInterval));
-        renderables.AddRange(DeviceCollectionTable.Render(devices, displayInterval));
-        var grid = new Grid();
-        grid.AddColumn();
-        foreach (var renderable in renderables)
+        string modeDescription = mode switch
         {
-            grid.AddRow(renderable);
+            DisplayMode.A => "A: table",
+            DisplayMode.B => "B: meters",
+            _ => "C: history"
+        };
+        AnsiConsole.Write(new Markup($"[bold]NvHtop[/] [grey][[{DateTime.Now:HH:mm:ss}]][/], Refresh every {displayInterval}s  [grey]Mode {modeDescription} | A/B/C or Tab to switch | Q to quit[/]\n"));
+        if (!devices.Any())
+        {
+            AnsiConsole.Write(new Markup("[yellow]No GPUs detected.[/]"));
+            return;
         }
-        AnsiConsole.Write(grid);
+
+        switch (mode)
+        {
+            case DisplayMode.A:
+                AnsiConsole.Write(DeviceTableDisplay.Render(devices));
+                break;
+            case DisplayMode.B:
+                AnsiConsole.Write(new Markup("[green]█[/] Utilization  [cyan]█[/] Memory\n"));
+                AnsiConsole.Write(DeviceMeterDisplay.Render(devices, meterWidth, columnCount));
+                break;
+            case DisplayMode.C:
+                AnsiConsole.Write(new Markup("[green]Utilization[/] and [cyan]memory[/] history, left to right\n"));
+                AnsiConsole.Write(DeviceHistoryChartDisplay.Render(devices, graphWidth));
+                break;
+        }
     }
 }
 
-static class DeviceCollectionTable
+static class DeviceHistoryChartDisplay
 {
-    public static List<IRenderable> Render(DeviceCollection devices, double pollTime)
+    public static Grid Render(DeviceCollection devices, int graphWidth)
     {
-        List<IRenderable> renderables = [];
-        var table = new Table();
-        table.AddColumn("Type");
-        table.AddColumn("Id");
-        table.AddColumn("Name");
-        table.AddColumn("Temp");
-        table.AddColumn("Util");
-        table.AddColumn("Mem");
+        var grid = new Grid();
+        grid.AddColumn();
+
+        foreach (var device in devices)
+            grid.AddRow(RenderDeviceChart(device, devices.GetHistory(device), graphWidth));
+        return grid;
+    }
+
+    private static IRenderable RenderDeviceChart(DeviceInfo device, (int Util, int MemPct)[] samples, int graphWidth)
+    {
+        var chart = new Grid();
+        chart.AddColumn();
+        int currentMemPct = device.MemTotal == 0 ? 0 : Math.Clamp((int)(device.MemUsed * 100.0 / device.MemTotal), 0, 100);
+        chart.AddRow(new Markup($"[bold]GPU {Markup.Escape(device.Id)} {Markup.Escape(device.Name)}[/] [grey]{device.Temp}°C[/]"));
+        chart.AddRow(new Markup($"[green]U {device.Util,3}%[/] {RenderSeries(samples.Select(sample => sample.Util), graphWidth, true)}"));
+        chart.AddRow(new Markup($"[cyan]M {currentMemPct,3}%[/] {RenderSeries(samples.Select(sample => sample.MemPct), graphWidth, false)}"));
+        return chart;
+    }
+
+    private static string RenderSeries(IEnumerable<int> values, int width, bool utilization)
+    {
+        const string levels = "▁▂▃▄▅▆▇█";
+        var samples = values.TakeLast(width).ToArray();
+        int emptySamples = Math.Max(0, width - samples.Length);
+        var sparkline = new List<string>(width);
+        foreach (int value in samples)
+        {
+            int level = Math.Clamp(value * levels.Length / 101, 0, levels.Length - 1);
+            string color = utilization
+                ? value >= 80 ? "red" : value >= 40 ? "yellow" : "green"
+                : "cyan";
+            sparkline.Add($"[{color}]{levels[level]}[/]");
+        }
+        sparkline.AddRange(Enumerable.Repeat(" ", emptySamples));
+        return string.Join("", sparkline);
+    }
+}
+
+static class DeviceTableDisplay
+{
+    public static Table Render(DeviceCollection devices)
+    {
+        var table = new Table()
+            .Border(TableBorder.Rounded)
+            .BorderColor(Color.Grey)
+            .Expand();
+        table.AddColumn("[bold]GPU[/]");
+        table.AddColumn("[bold]Name[/]");
+        table.AddColumn("[bold]Temp[/]");
+        table.AddColumn("[bold]Utilization[/]");
+        table.AddColumn("[bold]Memory[/]");
+
         foreach (var device in devices)
         {
+            int util = Math.Clamp(device.Util, 0, 100);
+            int memPct = device.MemTotal == 0 ? 0 : Math.Clamp((int)(device.MemUsed * 100.0 / device.MemTotal), 0, 100);
             string tempColor = device.Temp >= 80 ? "red" : device.Temp >= 60 ? "yellow" : "green";
-            string utilColor = device.Util >= 80 ? "red" : device.Util >= 40 ? "yellow" : "green";
+            string utilColor = util >= 80 ? "red" : util >= 40 ? "yellow" : "green";
             table.AddRow(
-                device.Type.ToString().ToUpper(),
-                $"[bold]{device.Id}[/]",
-                device.Name,
+                $"[bold]{Markup.Escape(device.Id)}[/]",
+                Markup.Escape(device.Name),
                 $"[{tempColor}]{device.Temp}°C[/]",
-                $"[{utilColor}]{device.Util}%[/]",
-                $"[cyan]{device.MemUsed}[/]/[grey]{device.MemTotal}[/]"
+                $"[{utilColor}]{util}%[/]",
+                $"[cyan]{device.MemUsed:N0}[/]/[grey]{device.MemTotal:N0} MiB ({memPct}%)[/]"
             );
         }
-        renderables.Add(table);
-        renderables.Add(new Markup($"[bold]NvHtop[/] [grey][[{DateTime.Now:HH:mm:ss}]][/], Refresh every {pollTime}s\n"));
-        return renderables;
+        return table;
     }
 }
 
-static class DeviceGraphDisplay
+static class DeviceMeterDisplay
 {
-    public static List<IRenderable> Render(DeviceCollection devices, int graphWidth, int graphHeight, int availableWidth, int scaleInterval)
+    public static Grid Render(DeviceCollection devices, int meterWidth, int columnCount)
     {
+        var grid = new Grid();
+        for (int i = 0; i < columnCount; i++)
+            grid.AddColumn();
+
         var renderables = new List<IRenderable>();
         foreach (var device in devices)
+            renderables.Add(RenderDevicePanel(device, meterWidth));
+        for (int i = 0; i < renderables.Count; i += columnCount)
         {
-            var samples = devices.GetHistory(device)?.GetSamples() ?? Array.Empty<DeviceSample>();
-            renderables.AddRange(RenderDeviceChartSpectre(device, samples, graphWidth, graphHeight, availableWidth, scaleInterval));
+            var row = renderables.Skip(i).Take(columnCount).ToList();
+            while (row.Count < columnCount)
+                row.Add(new Text(""));
+            grid.AddRow(row.ToArray());
         }
-        return renderables;
+        return grid;
     }
 
-    private static List<IRenderable> RenderDeviceChartSpectre(DeviceInfo device, DeviceSample[] samples, int graphWidth, int graphHeight, int _, int scaleInterval)
+    private static IRenderable RenderDevicePanel(DeviceInfo device, int meterWidth)
     {
-        List<IRenderable> renderables = [
-            new Markup($"[bold]{device.Type} {device.Id}[/] [grey]{device.Name}[/]\n")
-        ];
         var grid = new Grid();
         grid.AddColumn();
-        grid.AddColumn();
-        for (int row = graphHeight - 1; row >= 0; row--)
-        {
-            int percent = (int)Math.Round((row + 1) * 100.0 / graphHeight);
-            string yLabel = (percent % scaleInterval == 0 || row == graphHeight - 1) ? $"[grey]{percent,3}%[/] │" : "    │";
-            var bars = new List<string>();
-            int pad = graphWidth - samples.Length;
-            for (int i = 0; i < pad; i++)
-            {
-                bars.Add("[grey]··[/]");
-                if (i != graphWidth - 1) bars.Add(" ");
-            }
-            for (int idx = 0; idx < samples.Length; idx++)
-            {
-                var s = samples[idx];
-                bool uOn = s.Util * graphHeight / 100 > row;
-                bool mOn = s.MemPct * graphHeight / 100 > row;
-                string utilColor = s.Util >= 80 ? "red" : s.Util >= 40 ? "yellow" : "green";
-                if ((percent % scaleInterval == 0 || row == graphHeight - 1) && !uOn && !mOn)
-                    bars.Add("[grey]··[/]");
-                else
-                    bars.Add($"{(uOn ? $"[{utilColor}]█[/]" : " ")}{(mOn ? "[cyan]█[/]" : " ")}");
-                if (idx != samples.Length - 1 || pad > 0)
-                    bars.Add(" ");
-            }
-            grid.AddRow(new Markup(yLabel), new Markup(string.Join("", bars)));
-        }
-        int chartWidth = graphWidth * 3 - 1;
-        grid.AddRow(new Markup("     └"), new Markup("[grey]" + new string('─', chartWidth) + "[/]"));
-        renderables.Add(grid);
-        return renderables;
+        int util = Math.Clamp(device.Util, 0, 100);
+        int memPct = device.MemTotal == 0 ? 0 : Math.Clamp((int)(device.MemUsed * 100.0 / device.MemTotal), 0, 100);
+        string tempColor = device.Temp >= 80 ? "red" : device.Temp >= 60 ? "yellow" : "green";
+        string utilColor = util >= 80 ? "red" : util >= 40 ? "yellow" : "green";
+        string title = $"[bold]GPU {Markup.Escape(device.Id)} {Markup.Escape(device.Name)}[/]  [{tempColor}]{device.Temp}°C[/]";
+        grid.AddRow(new Markup(title));
+        grid.AddRow(new Markup(
+            $"U [{utilColor}]{CreateBar(util, meterWidth)}[/] {util,3}%  " +
+            $"M [cyan]{CreateBar(memPct, meterWidth)}[/] {memPct,3}%"));
+        return grid;
+    }
+
+    private static string CreateBar(int percentage, int width)
+    {
+        int filled = percentage * width / 100;
+        return new string('█', filled) + new string('░', width - filled);
     }
 }
