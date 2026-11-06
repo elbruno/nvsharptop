@@ -22,6 +22,8 @@ And then run like so: nvsharptop.cs
 
 ![Example Run](/docs/example_run.png)
 
+When multiple GPUs are present, the app provides three display modes: a metrics table, a compact grid of utilization and memory meters, and utilization/memory sparklines showing recent history. Press `A`, `B`, or `C` to select a mode, `Tab` to cycle between them, or `Q` to quit.
+
 ## Notice
 
 This tool was developed with the aid of Copilot in VS Code in agent mode.
